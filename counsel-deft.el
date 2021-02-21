@@ -4,11 +4,11 @@
 ;; Description: Browse files in Emacs using ivy
 ;; Author:  zbelial <zjyzhaojiyang@gmail.com>
 ;; Maintainer:  zbelial <zjyzhaojiyang@gmail.com>
-;; Copyright (C) 2020, zbelial, all rights reserved.
+;; Copyright (C) 2021, zbelial, all rights reserved.
 ;; Created: 2021-02-20 17:08:12
 ;; Version: 0.1
 ;; URL: https://github.com/zbelial/counsel-deft.el
-;; Package-Requires: ((ivy "0.13.0"))
+;; Package-Requires: ((ivy "0.13.0") (f "0.20.0"))
 ;; Keywords:
 ;; Compatibility: GNU Emacs 27.1
 ;;
@@ -37,7 +37,8 @@
 ;; Floor, Boston, MA 02110-1301, USA.
 
 (require 'ivy)
-(require 'compile) ;; compilation-info-face, compilation-line-face
+(require 'f)
+(require 'eww)
 
 (defgroup counsel-deft nil
   "Browse files in Emacs using ivy."
@@ -55,131 +56,130 @@
   :type '(repeat string)
   :group 'counsel-deft)
 
+(defcustom counsel-deft-file-handler-alist
+  '(("html" . counsel-deft-open-html-with-eww))
+  "An alist associating open handler with file extention."
+  :type '(alist
+          :key-type (string)
+          :value-type (function)))
 
 ;;; Variables
-(defvar counsel--dir-timestamps (make-hash-table)
+(defvar counsel-deft--dir-timestamps (make-hash-table :test 'equal)
   "A Hash table used to keep diretory's timestamp of latest modification."
   )
 
-(defvar counsel--dir-subdirs (make-hash-table)
-  "A Hash table used to keep diretory's subdirs."
-  )
-
-(defvar counsel--dir-files (make-hash-table)
+(defvar counsel-deft--dir-files (make-hash-table :test 'equal)
   "A Hash table used to keep diretory's files(no subdir)."
   )
 
+(defvar counsel-deft--dirs '()
+  "All diretories in a given directory.")
 
-(defface counsel-deft-annotation-face nil
-  "Face used for annotation."
-  :group 'counsel-deft)
+(defun counsel-deft--file-modified-time (file)
+  "File's latest modification time."
+  (if (f-exists-p file)
+      (time-convert (file-attribute-modification-time (file-attributes file)) 'integer)
+    0))
 
-(defun counsel-deft-bookmarks-all()
-  (let (all bms)
-    (dolist (buf (buffer-list))
-      (setq bms (counsel-deft-bookmarks-in-buffer buf))
-      (when bms
-        (setq all (append all bms))))
-    all))
+(defun counsel-deft--dir-is-modified (dir)
+  "Check whether dir is modified."
+  (let ((tm (gethash (f-full dir) counsel-deft--dir-timestamps)))
+    (if tm
+        (> (counsel-deft--file-modified-time dir) tm)
+        t)))
 
-(defun counsel-deft-bookmarks-in-buffer (&optional buf)
-  "Gets a list of bookmarks in BUF, which can be a string or a buffer."
-  (let ((buf (or buf (buffer-name)))
-        (mklist (lambda (x) (if (listp x) x (list x)))))
-    (funcall mklist
-             (with-current-buffer buf
-               (apply 'append
-                      (mapcar mklist (remove nil (bm-lists))))))))
+(defun counsel-deft--file-not-hidden? (file)
+  "Return t if file is not hidden."
+  (not (string= (substring (f-filename file) 0 1) ".")))
 
-(defun counsel-deft-candidate-transformer (bm)
-  "Return a string displayed in counsel buffer."
-  (let ((bufname (plist-get bm :bufname))
-        (lineno (plist-get bm :lineno))
-        (content (plist-get bm :content))
-        (annotation (plist-get bm :annotation)))
-    (format "%s:%s:%s%s"
-            (propertize bufname 'face compilation-info-face)
-            (propertize lineno 'face compilation-line-face)
-            content
-            (if (s-blank? annotation) ""
-              (concat "\n  "
-                      (propertize annotation 'face
-                                  'counsel-deft-annotation-face))))))
+(defun counsel-deft--all-subdirs (dir)
+  "All subdirs."
+  (setq counsel-deft--dirs '())
+  (when (f-exists? (f-full dir))
+    (add-to-list 'counsel-deft--dirs (f-full dir))
+    (counsel-deft--all-subdirs-recursive dir))
+  counsel-deft--dirs)
 
-(defun counsel-deft-transform-to-candicate (bm)
-  "Convert a BM to a CANDICATE."
-  (let ((current-buf (overlay-buffer bm)))
-    (with-current-buffer current-buf
-      (let* ((start (overlay-start bm))
-             (end (overlay-end bm))
-             (bufname (buffer-name current-buf))
-             (annotation (overlay-get bm 'annotation))
-             (lineno (line-number-at-pos start)))
-        (unless (< (- end start) 1)
-          (list 
-           :bufname bufname
-           :lineno (int-to-string lineno)
-           :content (buffer-substring-no-properties start (1- end))
-           :annotation annotation))))))
+(defun counsel-deft--all-subdirs-recursive (dir)
+  "All subdirs, in recursive way."
+  (when (f-exists? dir)
+    (let ((dirs (f-directories dir #'counsel-deft--file-not-hidden? nil)))
+      (when dirs
+        (setq counsel-deft--dirs (append counsel-deft--dirs (mapcar #'f-full dirs)))
+        (dolist (dir dirs)
+          (counsel-deft--all-subdirs-recursive dir))))))
 
+(defun counsel-deft--file-filter (file)
+  "Filter out files which's ext is not in `counsel-deft-extensions'."
+  (let ((ext (f-ext file)))
+    (member ext counsel-deft-extensions)))
 
-(defun counsel-deft-collector (&optional all)
-  (let ((bms (mapcar #'counsel-deft-transform-to-candicate
-                     (if all
-                         (counsel-deft-bookmarks-all)
-                       (counsel-deft-bookmarks-in-buffer)))))
-    (delq nil (mapcar #'(lambda (bm)
-                          (cons (counsel-deft-candidate-transformer bm) bm))
-                      bms))))
+(defun counsel-deft--all-files (dir)
+  "All files in directory and sub-directories, recursively."
+  (let (all-files files)
+    (counsel-deft--all-subdirs dir)
+    (when counsel-deft--dirs
+      (dolist (dir counsel-deft--dirs)
+        (setq files '())
+        (if (counsel-deft--dir-is-modified dir)
+            (progn
+              (message "directory %s is modified" dir)
+              ;; (setq files (seq-filter #'counsel-deft--file-filter (f-files dir #'counsel-deft--file-not-hidden? nil)))
+              (setq files (f-files dir #'counsel-deft--file-not-hidden? nil))
+              (puthash dir (counsel-deft--file-modified-time dir) counsel-deft--dir-timestamps)
+              (puthash dir files counsel-deft--dir-files)
+              )
+          (message "directory %s is not modified" dir)
+          (setq files (gethash dir counsel-deft--dir-files)))
+        (setq all-files (append all-files files))))
+    (seq-filter #'counsel-deft--file-filter all-files)))
 
-(defun counsel-deft-goto-line (linum &optional buf)
-  (let ((buf (or buf (current-buffer))))
-    (with-current-buffer buf
-      (goto-char (point-min))
-      (forward-line (1- linum)))))
+(defun counsel-deft-clear-cache ()
+  "Clear all caches. Used primarily for test."
+  (interactive)
+  (setq counsel-deft--dirs '())
+  (setq counsel-deft--dir-files (make-hash-table :test 'equal))
+  (setq counsel-deft--dir-timestamps (make-hash-table :test 'equal))
+  )
 
-(defun counsel-deft-jump (cand)
-  (let* ((bm (cdr cand))
-         (bufname (plist-get bm :bufname))
-         (lineno (plist-get bm :lineno)))
-    (switch-to-buffer bufname)
-    (counsel-deft-goto-line (string-to-number lineno))
-    (recenter)))
-
+(defun counsel-deft--open (file)
+  "Open file, according to `counsel-deft-file-handler-alist'."
+  (let* ((ext (f-ext file))
+         (handler (assoc ext counsel-deft-file-handler-alist)))
+    (if handler
+        (funcall (cdr handler) file)
+      (find-file file))))
 
 (defun counsel-deft ()
+  "Browse files in `counsel-deft-directory'."
   (interactive)
-  (let* ((all (if (equal current-prefix-arg nil)
-                  nil
-                t))
-         (bms (counsel-deft-collector all))
-         (linum (line-number-at-pos))
-         (preselect 0))
-    (dolist (bm bms)
-      (when (< (string-to-number (plist-get (cdr bm) :lineno)) linum)
-        (setq preselect (1+ preselect)))
-      )
-    (ivy-read "Visible bookmarks: " bms
-              :preselect preselect
+  (let* ((all-files (counsel-deft--all-files counsel-deft-directory)))
+    (ivy-read "All files: " all-files
               :action '(1
-                        ("o" counsel-deft-jump "jump to bookmark")
+                        ("o" counsel-deft--open "open file")
                         )
-              :caller 'counsel-deft
-              )))
+              :caller 'counsel-deft)
+    )
+  )
 
+(defun counsel-deft-interactive ()
+  "Browse files in a directory selected interactively."
+  (interactive)
+  (let* ((dir (read-directory-name "Browse dir: "))
+         (all-files (counsel-deft--all-files dir)))
+    (ivy-read "All files: " all-files
+              :action '(1
+                        ("o" counsel-deft--open "open file")
+                        )
+              :caller 'counsel-deft)
+    )
+  )
 
-(defun counsel-deft-sorter (&optional l r)
-  (let* ((lr (cdr l))
-         (rr (cdr r))
-         (lb (plist-get lr :bufname))
-         (rb (plist-get rr :bufname))
-         (lp (string-to-number (plist-get lr :lineno)))
-         (rp (string-to-number (plist-get rr :lineno))))
-    (or (string< lb rb)
-        (or (and (string= lb rb)
-                 (< lp rp))))))
+(defun counsel-deft-open-html-with-eww (file)
+  "Open html with eww."
+  (interactive)
+  (eww-browse-url (concat "file://" file) t)
+  )
 
-(ivy-configure 'counsel-deft
-  :sort-fn #'counsel-deft-sorter)
 
 (provide 'counsel-deft)
