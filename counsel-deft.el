@@ -150,17 +150,19 @@
         (funcall (cdr handler) file)
       (find-file file))))
 
+(defvar counsel-deft--files nil "all files in `counsel-deft-directory'")
 (defun counsel-deft ()
   "Browse files in `counsel-deft-directory'."
   (interactive)
-  (let* ((all-files (counsel-deft--all-files counsel-deft-directory)))
-    (ivy-read "All files: " all-files
-              :action '(1
-                        ("o" counsel-deft--open "open file")
-                        )
-              :caller 'counsel-deft)
-    )
-  )
+  (when current-prefix-arg
+    (setq counsel-deft--files nil))
+  (unless counsel-deft--files
+    (setq counsel-deft--files (counsel-deft--all-files counsel-deft-directory)))
+  (ivy-read "All files: " counsel-deft--files
+            :action '(1
+                      ("o" counsel-deft--open "open file")
+                      )
+            :caller 'counsel-deft))
 
 (defun counsel-deft-interactive ()
   "Browse files in a directory selected interactively."
